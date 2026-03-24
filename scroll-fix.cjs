@@ -1,23 +1,22 @@
 /**
- * scroll-fix.cjs — Fixes terminal scroll-to-top regression in Claude Code
+ * scroll-fix.cjs — Fixes viewport jumping + adds scrollback for Claude Code
  *
- * ROOT CAUSE:
- *   TWO sources of excessive cursor-up sequences:
- *   1. Ink renderer's eraseLines() within synchronized output blocks
- *   2. Readline/prompt system's eraseLines(this.height) OUTSIDE sync blocks
- *   Both generate cursor-up sequences exceeding viewport height, causing
- *   ALL terminals to snap the viewport to the top.
+ * TWO FIXES IN ONE FILE:
  *
- * FIX:
- *   Intercepts ALL process.stdout.write calls. Every cursor-up sequence
- *   (\x1b[{n}A) is clamped so the TOTAL cursor-up per write call never
- *   exceeds process.stdout.rows. No sync-block tracking needed.
+ * 1. VIEWPORT JUMPING (from @cruzlauroiii's PR #35683):
+ *    Clamps cursor-up sequences so total upward movement per write
+ *    never exceeds viewport height. Stops the "yank to bottom".
  *
- * ADDITIONAL — Ctrl+6 freeze toggle:
- *   Press Ctrl+6 to freeze all re-render output. Press again to unfreeze.
+ * 2. SCROLLBACK INJECTION (new):
+ *    Captures rendered frames, diffs them, and emits new settled content
+ *    as plain text into the terminal's native scrollback buffer.
+ *    When Ink erases and redraws, the emitted content is already above
+ *    its reach — it persists in scrollback for trackpad scrolling.
  *
- * Source: https://github.com/anthropics/claude-code/pull/35683
- * Bug fix: Added isTTY guard + .unref() to prevent child process hangs
+ * BONUS — Ctrl+6 freeze toggle:
+ *    Press Ctrl+6 to freeze output. Press again to resume.
+ *
+ * Source: https://github.com/yasinarshad/claude-code-scroll-fix
  */
 
 "use strict";
@@ -27,8 +26,61 @@
   var _frozen = false;
   var _buf = [];
 
+  /* — Scrollback state ——————————————————————————————————————————————— */
+  var _prevFrameLines = [];     // Previous frame's clean text lines
+  var _emittedLines = {};       // Hash → true for lines already in scrollback
+  var _stableTimer = null;      // Debounce timer for settled content
+  var _currentFrameRaw = "";    // Accumulates raw output for current frame
+  var _hasRedraw = false;       // Did we see cursor-up in this write?
+  var _frameCount = 0;          // Frame counter for dedup
+  var _lastEmitFrame = 0;       // Last frame we emitted scrollback for
+
+  /* Simple string hash for dedup */
+  function _hash(s) {
+    var h = 0;
+    for (var i = 0; i < s.length; i++) {
+      h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+    }
+    return h;
+  }
+
+  /* Strip ANSI escape sequences to get plain text */
+  function _stripAnsi(s) {
+    return s
+      .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")   // CSI sequences
+      .replace(/\x1b\][^\x07]*\x07/g, "")       // OSC sequences
+      .replace(/\x1b\[\?[0-9;]*[a-zA-Z]/g, "")  // Private mode sequences
+      .replace(/\x1b[()][AB012]/g, "")           // Character set sequences
+      .replace(/\r/g, "");                        // Carriage returns
+  }
+
+  /* Emit settled content into terminal scrollback */
+  function _emitScrollback() {
+    if (_prevFrameLines.length === 0) return;
+    if (_frameCount <= _lastEmitFrame + 2) return; // Need at least 2 stable frames
+
+    var newLines = [];
+    for (var i = 0; i < _prevFrameLines.length; i++) {
+      var line = _prevFrameLines[i];
+      if (!line || !line.trim()) continue; // Skip empty lines
+      var h = _hash(line);
+      if (!_emittedLines[h]) {
+        newLines.push(line);
+        _emittedLines[h] = true;
+      }
+    }
+
+    if (newLines.length > 0) {
+      /* Emit clean text + separator. These lines appear at the current cursor
+       * position. When Ink next redraws with a clamped cursor-up, these lines
+       * will be above its reach and persist in terminal scrollback. */
+      var scrollbackText = "\n" + newLines.join("\n") + "\n\x1b[90m" + "─".repeat(40) + "\x1b[0m\n";
+      _ow(scrollbackText);
+      _lastEmitFrame = _frameCount;
+    }
+  }
+
   /* — Ctrl+6 freeze toggle (\x1e) ———————————————————————————————————— */
-  /* Only attach stdin listener in interactive terminals (fixes .unref bug) */
   if (process.stdout.isTTY) {
     var _t = setTimeout(function () {
       try {
@@ -68,17 +120,49 @@
           : String(d);
     var maxUp = process.stdout.rows || 24;
 
-    /* Clamp cursor-up per write call.
-     * Never let total upward movement in a single write exceed viewport. */
-    var upBudget = maxUp;
+    /* Detect redraw: cursor-up sequences signal start of new frame */
+    _hasRedraw = false;
 
+    /* Clamp cursor-up per write call */
+    var upBudget = maxUp;
     s = s.replace(/\x1b\[(\d*)A/g, function (m, p) {
       var n = parseInt(p) || 1;
+      _hasRedraw = true;
       if (upBudget <= 0) return "";
       var allowed = n > upBudget ? upBudget : n;
       upBudget -= allowed;
       return "\x1b[" + allowed + "A";
     });
+
+    /* Track frames for scrollback */
+    if (process.stdout.isTTY) {
+      if (_hasRedraw) {
+        /* New frame starting — process the previous frame */
+        _frameCount++;
+        var cleanText = _stripAnsi(_currentFrameRaw);
+        var lines = cleanText.split("\n").filter(function (l) {
+          return l.trim().length > 0;
+        });
+
+        if (lines.length > 0) {
+          _prevFrameLines = lines;
+        }
+
+        _currentFrameRaw = "";
+
+        /* Debounce: emit scrollback after 800ms of stability */
+        if (_stableTimer) {
+          clearTimeout(_stableTimer);
+        }
+        _stableTimer = setTimeout(function () {
+          _emitScrollback();
+        }, 800);
+        _stableTimer.unref();
+      }
+
+      /* Accumulate current frame content */
+      _currentFrameRaw += s;
+    }
 
     /* Freeze: buffer ALL output when frozen */
     if (_frozen) {
