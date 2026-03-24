@@ -1,6 +1,6 @@
 # claude-code-scroll-fix
 
-Fix Claude Code's viewport jumping with a single JS file. No dependencies, no PTY proxy, native terminal scrollback preserved.
+Fix Claude Code's viewport jumping with a single JS file. No dependencies, no PTY proxy.
 
 ## The Problem
 
@@ -8,15 +8,11 @@ When Claude Code streams output, your terminal viewport **yanks to the bottom** 
 
 **Why it happens:** Claude Code uses [Ink](https://github.com/vadimdemedes/ink) (React for terminals), which redraws the entire screen 30 times per second. Each redraw emits cursor-up escape sequences (`\x1b[{N}A`) that exceed your viewport height. Your terminal **must** follow these cursor movements — that's how VT100 has worked since 1978. The result: you get yanked to the bottom on every render frame.
 
-There are two separate problems:
-1. **Viewport jumping** — cursor-up sequences during re-render exceed viewport height (651+ reactions on [#826](https://github.com/anthropics/claude-code/issues/826))
-2. **Limited scrollback** — hardcoded buffer cap since v2.1.76 to prevent a [5.7 GB RAM leak](https://github.com/anthropics/claude-code/issues/21806)
+This fix targets the viewport jumping problem — 651+ reactions on [#826](https://github.com/anthropics/claude-code/issues/826).
 
 ## The Fix
 
 A single JavaScript file that runs **inside** Claude Code's Node.js process. It intercepts `process.stdout.write` and clamps cursor-up sequences so the total upward movement per write never exceeds your viewport height.
-
-Because it runs inside the process (not as an external proxy), your terminal's native scrollback and trackpad scrolling work normally.
 
 ## Quick Start
 
@@ -85,13 +81,12 @@ The fix intercepts every `process.stdout.write` call and applies a per-write "cu
 
 ### Why not use a PTY proxy?
 
-Tools like [claude-chill](https://github.com/davidbeesley/claude-chill) solve the jumping by sitting between your terminal and Claude Code. The tradeoff: your terminal can't access its own scrollback buffer because the proxy consumed the output stream. Native trackpad scrolling breaks.
+Tools like [claude-chill](https://github.com/davidbeesley/claude-chill) solve the jumping by sitting between your terminal and Claude Code as an external proxy. The tradeoff: your terminal loses native trackpad scrolling because the proxy intercepts the output stream.
 
-This fix runs inside Node.js, so your terminal is still directly connected to the process. Native scrollback, trackpad scrolling, and all terminal features work normally.
+This fix runs inside Node.js — your terminal is still directly connected to the process, so trackpad scrolling and all terminal features work normally.
 
 ## What This Doesn't Fix
 
-- **Scrollback history limit** — Claude Code caps its internal buffer to prevent memory leaks. This is a separate issue.
 - **Flickering during fast output** — Reduced but not eliminated. The fix clamps cursor movement but Ink still redraws at 30 FPS.
 
 ## Known Issues
@@ -108,7 +103,6 @@ This fix runs inside Node.js, so your terminal is still directly connected to th
 | Issue | Description |
 |-------|------------|
 | [anthropics/claude-code#826](https://github.com/anthropics/claude-code/issues/826) | Terminal flashing/flickering (651+ reactions) |
-| [anthropics/claude-code#28077](https://github.com/anthropics/claude-code/issues/28077) | Alternate screen buffer scrollback |
 | [anthropics/claude-code#35683](https://github.com/anthropics/claude-code/pull/35683) | Original scroll-fix PR (unmerged) |
 | [microsoft/terminal#14774](https://github.com/microsoft/terminal/issues/14774) | Windows Terminal cursor-up issue |
 
