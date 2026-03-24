@@ -1,18 +1,24 @@
 # claude-code-scroll-fix
 
-Fix Claude Code's viewport jumping with a single JS file. No dependencies, no PTY proxy.
+Fix Claude Code's viewport jumping + add native scrollback. Single JS file, no dependencies, no PTY proxy.
 
 ## The Problem
 
-When Claude Code streams output, your terminal viewport **yanks to the bottom** — making it impossible to read earlier content while the agent is working. This affects every terminal emulator (Ghostty, iTerm2, Terminal.app, Kitty, WezTerm, etc.).
+Claude Code has two terminal problems that affect every terminal emulator (Ghostty, iTerm2, Terminal.app, Kitty, WezTerm, etc.):
 
-**Why it happens:** Claude Code uses [Ink](https://github.com/vadimdemedes/ink) (React for terminals), which redraws the entire screen 30 times per second. Each redraw emits cursor-up escape sequences (`\x1b[{N}A`) that exceed your viewport height. Your terminal **must** follow these cursor movements — that's how VT100 has worked since 1978. The result: you get yanked to the bottom on every render frame.
+1. **Viewport jumping** — when Claude streams output, your viewport yanks to the bottom. You can't read earlier content while the agent is working. (651+ reactions on [#826](https://github.com/anthropics/claude-code/issues/826))
 
-This fix targets the viewport jumping problem — 651+ reactions on [#826](https://github.com/anthropics/claude-code/issues/826).
+2. **No scrollback** — you can't scroll up to see previous messages. Ink (React for terminals) erases and redraws in place — content never enters your terminal's scrollback buffer.
+
+**Why it happens:** Claude Code uses [Ink](https://github.com/vadimdemedes/ink), which redraws the entire screen 30 times per second. Each redraw emits cursor-up escape sequences (`\x1b[{N}A`) that exceed your viewport height. Your terminal **must** follow these cursor movements — that's how VT100 has worked since 1978.
 
 ## The Fix
 
-A single JavaScript file that runs **inside** Claude Code's Node.js process. It intercepts `process.stdout.write` and clamps cursor-up sequences so the total upward movement per write never exceeds your viewport height.
+A single JavaScript file that runs **inside** Claude Code's Node.js process. It does two things:
+
+**1. Stops viewport jumping** — intercepts `process.stdout.write` and clamps cursor-up sequences so the total upward movement per write never exceeds your viewport height.
+
+**2. Adds native scrollback** — captures rendered frames, strips ANSI escape sequences, diffs them to find new content, and after 500ms of stability emits clean text into your terminal's native scrollback buffer. Scroll up with your trackpad to see previous messages.
 
 ## Quick Start
 
@@ -69,6 +75,8 @@ Press **Ctrl+6** to freeze Claude Code's output while you read. Press again to r
 
 ## How It Works
 
+### Viewport Fix
+
 ```
 Without scroll-fix:
   Ink renderer → \x1b[500A (cursor up 500 lines) → Terminal follows cursor → YANK
@@ -77,7 +85,21 @@ With scroll-fix:
   Ink renderer → \x1b[500A → scroll-fix clamps to \x1b[24A → Terminal stays put
 ```
 
-The fix intercepts every `process.stdout.write` call and applies a per-write "cursor-up budget" equal to `process.stdout.rows` (your viewport height). Any cursor-up sequences beyond that budget are stripped. The terminal never sees excessive cursor movement, so it never jumps.
+Intercepts every `process.stdout.write` call and applies a per-write "cursor-up budget" equal to `process.stdout.rows` (your viewport height). Any cursor-up sequences beyond that budget are stripped.
+
+### Scrollback Injection
+
+```
+Without scroll-fix:
+  Ink redraws in place → old content erased → scrollback buffer empty
+
+With scroll-fix:
+  Frame captured → ANSI stripped → diffed against previous frame → new content
+  emitted as clean text → pushed above viewport with padding → persists in
+  native scrollback buffer
+```
+
+After each response settles (500ms debounce), the fix emits clean text into the terminal's scrollback buffer with enough padding to push it above Ink's reach. Position-aware deduplication prevents the same content from appearing twice. The dedup map is capped at 50K entries to prevent memory growth in long sessions. On process exit, the final frame is flushed to scrollback.
 
 ### Why not use a PTY proxy?
 
@@ -92,11 +114,12 @@ This fix runs inside Node.js — your terminal is still directly connected to th
 ## Known Issues
 
 - The `NODE_OPTIONS="--require ..."` flag is inherited by child Node.js processes. The fix includes guards (`isTTY` check, `.unref()`) to prevent interference, but if you encounter hanging `npm install` or similar, this could be the cause. Remove the env var for those commands.
+- Scrollback injection is v1 — some visual artifacts may appear in the scrollback between clean content and Ink's raw output.
 
 ## Credits
 
-- **[@cruzlauroiii](https://github.com/cruzlauroiii)** — Original scroll-fix approach ([PR #35683](https://github.com/anthropics/claude-code/pull/35683) on anthropics/claude-code)
-- **[@yasinarshad](https://github.com/yasinarshad)** — Bug fix (isTTY guard + `.unref()` to prevent child process hangs), documentation, and terminal setup guides
+- **[@cruzlauroiii](https://github.com/cruzlauroiii)** — Original viewport fix approach ([PR #35683](https://github.com/anthropics/claude-code/pull/35683) on anthropics/claude-code)
+- **[@yasinarshad](https://github.com/yasinarshad)** — Bug fixes (isTTY guard, `.unref()`, memory cap), scrollback injection, and documentation
 
 ## Related Issues
 
@@ -104,6 +127,7 @@ This fix runs inside Node.js — your terminal is still directly connected to th
 |-------|------------|
 | [anthropics/claude-code#826](https://github.com/anthropics/claude-code/issues/826) | Terminal flashing/flickering (651+ reactions) |
 | [anthropics/claude-code#35683](https://github.com/anthropics/claude-code/pull/35683) | Original scroll-fix PR (unmerged) |
+| [anthropics/claude-code#28077](https://github.com/anthropics/claude-code/issues/28077) | Scrollback history limitation |
 | [microsoft/terminal#14774](https://github.com/microsoft/terminal/issues/14774) | Windows Terminal cursor-up issue |
 
 ## License
