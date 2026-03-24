@@ -28,56 +28,90 @@
 
   /* — Scrollback state ——————————————————————————————————————————————— */
   var _prevFrameLines = [];     // Previous frame's clean text lines
-  var _emittedLines = {};       // Hash → true for lines already in scrollback
+  var _emittedContent = {};     // "lineNum:hash" → true (position-aware dedup)
+  var _emittedCount = 0;        // Track hash map size for memory management
   var _stableTimer = null;      // Debounce timer for settled content
   var _currentFrameRaw = "";    // Accumulates raw output for current frame
   var _hasRedraw = false;       // Did we see cursor-up in this write?
-  var _frameCount = 0;          // Frame counter for dedup
-  var _lastEmitFrame = 0;       // Last frame we emitted scrollback for
+  /* Note: _currentFrameRaw serves as the "last frame" buffer for exit flush */
 
-  /* Simple string hash for dedup */
-  function _hash(s) {
-    var h = 0;
+  /* Maximum entries in _emittedContent before pruning (prevents unbounded growth) */
+  var _EMIT_MAP_MAX = 50000;
+
+  /* Position-aware hash: same text at different positions = different entry */
+  function _posHash(idx, s) {
+    var h = idx;
     for (var i = 0; i < s.length; i++) {
       h = ((h << 5) - h + s.charCodeAt(i)) | 0;
     }
-    return h;
+    return idx + ":" + h;
   }
 
   /* Strip ANSI escape sequences to get plain text */
   function _stripAnsi(s) {
     return s
-      .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")   // CSI sequences
-      .replace(/\x1b\][^\x07]*\x07/g, "")       // OSC sequences
-      .replace(/\x1b\[\?[0-9;]*[a-zA-Z]/g, "")  // Private mode sequences
+      .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")   // CSI sequences (SGR, cursor, erase, etc.)
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")  // OSC sequences (BEL or ST terminated)
+      .replace(/\x1b\[\?[0-9;]*[a-zA-Z]/g, "")  // Private mode sequences (?25l, ?1049h, etc.)
       .replace(/\x1b[()][AB012]/g, "")           // Character set sequences
+      .replace(/\x1b[78]/g, "")                   // DEC cursor save (\x1b7) and restore (\x1b8)
       .replace(/\r/g, "");                        // Carriage returns
   }
 
   /* Emit settled content into terminal scrollback */
   function _emitScrollback() {
     if (_prevFrameLines.length === 0) return;
-    if (_frameCount <= _lastEmitFrame + 2) return; // Need at least 2 stable frames
+
+    /* Prune the hash map if it grows too large (memory safety) */
+    if (_emittedCount > _EMIT_MAP_MAX) {
+      _emittedContent = {};
+      _emittedCount = 0;
+    }
 
     var newLines = [];
     for (var i = 0; i < _prevFrameLines.length; i++) {
       var line = _prevFrameLines[i];
-      if (!line || !line.trim()) continue; // Skip empty lines
-      var h = _hash(line);
-      if (!_emittedLines[h]) {
+      var key = _posHash(i, line);
+      if (!_emittedContent[key]) {
         newLines.push(line);
-        _emittedLines[h] = true;
+        _emittedContent[key] = true;
+        _emittedCount++;
       }
     }
 
     if (newLines.length > 0) {
-      /* Emit clean text + separator. These lines appear at the current cursor
-       * position. When Ink next redraws with a clamped cursor-up, these lines
-       * will be above its reach and persist in terminal scrollback. */
+      /* Emit clean text + separator. We push enough newlines to scroll the
+       * emitted content above the viewport so Ink's clamped cursor-up can't
+       * reach it. The padding ensures the content survives the next redraw. */
+      var maxUp = process.stdout.rows || 24;
       var scrollbackText = "\n" + newLines.join("\n") + "\n\x1b[90m" + "─".repeat(40) + "\x1b[0m\n";
+
+      /* Pad with enough newlines to push content above viewport.
+       * This ensures Ink's next cursor-up (clamped to viewport height)
+       * cannot reach back to overwrite the emitted text. */
+      var padding = maxUp - newLines.length;
+      if (padding > 0) {
+        scrollbackText += "\n".repeat(padding);
+        /* Move cursor back up to where Ink expects it */
+        scrollbackText += "\x1b[" + padding + "A";
+      }
+
       _ow(scrollbackText);
-      _lastEmitFrame = _frameCount;
     }
+  }
+
+  /* Flush final frame on process exit (synchronous) */
+  if (process.stdout.isTTY) {
+    process.on("exit", function () {
+      if (_currentFrameRaw.length > 0) {
+        var cleanText = _stripAnsi(_currentFrameRaw);
+        var lines = cleanText.split("\n");
+        if (lines.length > 0) {
+          _prevFrameLines = lines;
+        }
+      }
+      _emitScrollback();
+    });
   }
 
   /* — Ctrl+6 freeze toggle (\x1e) ———————————————————————————————————— */
@@ -138,25 +172,30 @@
     if (process.stdout.isTTY) {
       if (_hasRedraw) {
         /* New frame starting — process the previous frame */
-        _frameCount++;
         var cleanText = _stripAnsi(_currentFrameRaw);
-        var lines = cleanText.split("\n").filter(function (l) {
-          return l.trim().length > 0;
-        });
+        /* Preserve blank lines for code block formatting */
+        var lines = cleanText.split("\n");
 
-        if (lines.length > 0) {
+        /* Filter out frames that are purely empty (only whitespace/cursor movement) */
+        var hasContent = false;
+        for (var li = 0; li < lines.length; li++) {
+          if (lines[li].trim().length > 0) { hasContent = true; break; }
+        }
+
+        if (hasContent) {
           _prevFrameLines = lines;
         }
 
         _currentFrameRaw = "";
 
-        /* Debounce: emit scrollback after 800ms of stability */
+        /* Debounce: emit scrollback after 500ms of stability
+         * (800ms was too conservative — Ink may only send 1 final frame) */
         if (_stableTimer) {
           clearTimeout(_stableTimer);
         }
         _stableTimer = setTimeout(function () {
           _emitScrollback();
-        }, 800);
+        }, 500);
         _stableTimer.unref();
       }
 
