@@ -30,9 +30,11 @@
   var _prevFrameLines = [];     // Previous frame's clean text lines
   var _emittedContent = {};     // "lineNum:hash" → true (position-aware dedup)
   var _emittedCount = 0;        // Track hash map size for memory management
-  var _stableTimer = null;      // Debounce timer for settled content
   var _currentFrameRaw = "";    // Accumulates raw output for current frame
   var _hasRedraw = false;       // Did we see cursor-up in this write?
+  var _lastContentHash = 0;     // Hash of previous frame's stripped content
+  var _sameHashCount = 0;       // How many consecutive frames had the same hash
+  var _SETTLE_THRESHOLD = 2;    // Emit after content is identical for N consecutive frames
   /* Note: _currentFrameRaw serves as the "last frame" buffer for exit flush */
 
   /* Maximum entries in _emittedContent before pruning (prevents unbounded growth) */
@@ -86,15 +88,13 @@
       var maxUp = process.stdout.rows || 24;
       var scrollbackText = "\n" + newLines.join("\n") + "\n\x1b[90m" + "─".repeat(40) + "\x1b[0m\n";
 
-      /* Pad with enough newlines to push content above viewport.
-       * This ensures Ink's next cursor-up (clamped to viewport height)
-       * cannot reach back to overwrite the emitted text. */
-      var padding = maxUp - newLines.length;
-      if (padding > 0) {
-        scrollbackText += "\n".repeat(padding);
-        /* Move cursor back up to where Ink expects it */
-        scrollbackText += "\x1b[" + padding + "A";
-      }
+      /* Always pad by full viewport height to push content above Ink's reach.
+       * Ink's cursor-up is clamped to maxUp, so padding by maxUp guarantees
+       * the emitted text is unreachable regardless of content length. */
+      var padding = maxUp;
+      scrollbackText += "\n".repeat(padding);
+      /* Move cursor back up to where Ink expects it */
+      scrollbackText += "\x1b[" + padding + "A";
 
       _ow(scrollbackText);
     }
@@ -184,19 +184,29 @@
 
         if (hasContent) {
           _prevFrameLines = lines;
+
+          /* Content-hash settlement: compute a hash of the stripped frame.
+           * When the same hash appears N times in a row, content has settled
+           * and we emit. This replaces the time-based debounce which broke
+           * when continuous UI redraws (spinners, status line) reset the timer. */
+          var contentHash = 0;
+          for (var ci = 0; ci < cleanText.length; ci++) {
+            contentHash = ((contentHash << 5) - contentHash + cleanText.charCodeAt(ci)) | 0;
+          }
+
+          if (contentHash === _lastContentHash) {
+            _sameHashCount++;
+            if (_sameHashCount >= _SETTLE_THRESHOLD) {
+              _emitScrollback();
+              _sameHashCount = 0;
+            }
+          } else {
+            _lastContentHash = contentHash;
+            _sameHashCount = 1;
+          }
         }
 
         _currentFrameRaw = "";
-
-        /* Debounce: emit scrollback after 500ms of stability
-         * (800ms was too conservative — Ink may only send 1 final frame) */
-        if (_stableTimer) {
-          clearTimeout(_stableTimer);
-        }
-        _stableTimer = setTimeout(function () {
-          _emitScrollback();
-        }, 500);
-        _stableTimer.unref();
       }
 
       /* Accumulate current frame content */
